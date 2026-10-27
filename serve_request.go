@@ -48,6 +48,7 @@ func (r Origin) String() string {
 }
 
 type Runtime struct {
+	ctx        context.Context // per-execution cancellation (for leased jobs)
 	config     *Config
 	fiber      *fiber.Ctx
 	logger     *zap.Logger
@@ -240,6 +241,9 @@ func cachedRegex(rx string) (*regexp.Regexp, error) {
 }
 
 func (r *Runtime) Context() context.Context {
+	if r.ctx != nil {
+		return r.ctx
+	}
 	if r.fiber != nil {
 		return r.fiber.UserContext()
 	}

@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/wh-kuromai/allino/internal/ema"
 	"github.com/wh-kuromai/allino/internal/timewheel"
 	"go.uber.org/zap"
@@ -46,11 +47,12 @@ type callSQLStrategy struct {
 }
 
 type sqlJobTask struct {
-	strategy *callSQLStrategy
-	key      string
-	handler  string
-	meta     *JobMeta
-	input    []byte
+	leaseToken string
+	strategy   *callSQLStrategy
+	key        string
+	handler    string
+	meta       *JobMeta
+	input      []byte
 }
 
 func (t *sqlJobTask) Key() string {
@@ -67,16 +69,19 @@ func (t *sqlJobTask) Input() []byte {
 	return t.input
 }
 func (t *sqlJobTask) Success(ctx context.Context, handler string, meta *JobMeta, key string, injson []byte, outjson []byte, errjson []byte) (err error) {
-	return t.strategy.doneAsync(ctx, handler, meta, key, injson, outjson, errjson)
+	if t.leaseToken == "" || key != t.key {
+		return ErrJobLeaseLost
+	}
+	return t.strategy.doneAsyncWithLease(ctx, handler, meta, key, injson, outjson, errjson, t.leaseToken)
 }
 func (t *sqlJobTask) Fail(ctx context.Context) (err error) {
-	return t.strategy.Free(ctx, t.key)
+	return t.mutateLease(ctx, "release", 0, 0)
 }
 func (t *sqlJobTask) HeartBeat(ctx context.Context, lease_dur time.Duration) (err error) {
-	return t.strategy.LeaseUpdate(ctx, t.key, lease_dur)
+	return t.mutateLease(ctx, "heartbeat", lease_dur, 0)
 }
 func (t *sqlJobTask) Requeue(ctx context.Context, delay_sec int) error {
-	return t.strategy.requeue(ctx, t.key, delay_sec)
+	return t.mutateLease(ctx, "requeue", 0, delay_sec)
 }
 
 func newcallSQLStrategy(sv *Server) *callSQLStrategy {
@@ -111,7 +116,7 @@ func (c *callSQLStrategy) Init(ctx context.Context, allow_migrate bool) error {
 	}
 
 	if !allow_migrate {
-		return nil
+		return c.migrateLeaseToken(ctx, false)
 	}
 
 	// 0:queued 1:leased 2:done 3:error
@@ -133,7 +138,8 @@ CREATE TABLE IF NOT EXISTS executions (
 	run_at DATETIME NOT NULL,
 	created_at DATETIME NOT NULL,
 	updated_at DATETIME NOT NULL,
-	leased_until DATETIME
+	leased_until DATETIME,
+ lease_token TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_exec_queued
@@ -223,7 +229,10 @@ CREATE INDEX IF NOT EXISTS idx_exec_result_key
 ON executions(key);
 	`)
 
-	return err
+	if err != nil {
+		return err
+	}
+	return c.migrateLeaseToken(ctx, true)
 }
 
 func (c *callSQLStrategy) Enqueue(
@@ -257,6 +266,8 @@ ON CONFLICT(key) DO UPDATE SET
 	handler=excluded.handler,
 	version=excluded.version,
 	status=excluded.status,
+ lease_token=NULL,
+ leased_until=NULL,
 	parentid=excluded.parentid,
 	rootid=excluded.rootid,
 	priority=excluded.priority,
@@ -314,6 +325,7 @@ func (c *callSQLStrategy) Dequeue(
 
 	now := time.Now()
 	leaseUntil := now.Add(leaseDuration)
+	leaseToken := uuid.NewString()
 
 	// IN (?, ?, ...) を作る
 	placeholders := make([]string, len(handlers))
@@ -326,6 +338,7 @@ func (c *callSQLStrategy) Dequeue(
 	args := make([]any, 0, 4+len(handlers))
 	args = append(args,
 		leaseUntil, // SET leased_until = ?
+		leaseToken, // SET lease_token = ?
 		now,        // SET updated_at = ?
 		now,        // run_at <= ?
 		//now,        // leased_until < ?
@@ -348,6 +361,7 @@ UPDATE executions
 SET
   status = 1, -- leased
   leased_until = ?,
+  lease_token = ?,
   updated_at = ?
 WHERE id = (
   SELECT id
@@ -397,52 +411,43 @@ RETURNING
 	c.lastDequeuedId.Store(id)
 
 	return &sqlJobTask{
-		strategy: c,
-		key:      key,
-		handler:  handler,
-		meta:     &meta,
-		input:    injson,
+		leaseToken: leaseToken,
+		strategy:   c,
+		key:        key,
+		handler:    handler,
+		meta:       &meta,
+		input:      injson,
 	}, nil
 	//return key, handler, meta, injson, nil
 }
 
-func (c *callSQLStrategy) Reaping(
-	ctx context.Context,
-) (err error) {
-
-	// 0:queued 1:leased 2:done 3:error
+func (c *callSQLStrategy) Reaping(ctx context.Context) error {
+	if c.issqlite {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+	}
 	now := time.Now()
-	_, err = c.db.ExecContext(ctx, `
--- fail max retry over.
-UPDATE executions
-SET 
-    status = 3, -- error
-    error = '{"message": "max retries exceeded during reaping"}',
-    updated_at = ?
-WHERE 
-    status = 1 -- leased
-    AND leased_until < ?
-    AND retry_count >= ?;
-
--- requeue lease over
-UPDATE executions
-SET 
-    status = 0, -- queued
-    leased_until = NULL,
-    updated_at = ?,
-    retry_count = COALESCE(retry_count, 0) + 1
-WHERE 
-    status = 1 -- leased
-    AND leased_until < ?;
-
--- delete ttl over
-DELETE FROM executions
-WHERE (status = 2 OR status = 3) -- done, error
-	AND ttl IS NOT NULL
-	AND ttl < ?
-	`, now, now, c.maxretry, now, now)
-
-	return err
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `UPDATE executions SET status=3,
+ error='{"message":"max retries exceeded during reaping"}',updated_at=?,lease_token=NULL
+ WHERE status=1 AND leased_until<? AND COALESCE(retry_count,0)>=?`, now, now, c.maxretry)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE executions SET status=0,leased_until=NULL,lease_token=NULL,
+ updated_at=?,retry_count=COALESCE(retry_count,0)+1 WHERE status=1 AND leased_until<?`, now, now)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `DELETE FROM executions WHERE status IN (2,3) AND ttl IS NOT NULL AND ttl<?`, now)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (c *callSQLStrategy) LeaseUpdate(ctx context.Context, key string, lease_dur time.Duration) (err error) {
@@ -464,7 +469,7 @@ func (c *callSQLStrategy) LeaseUpdate(ctx context.Context, key string, lease_dur
 	return err
 }
 
-func (c *callSQLStrategy) doneAsync(
+func (c *callSQLStrategy) doneAsyncWithLease(
 	ctx context.Context,
 	handler string,
 	meta *JobMeta,
@@ -472,6 +477,7 @@ func (c *callSQLStrategy) doneAsync(
 	injson []byte,
 	outjson []byte,
 	errjson []byte,
+	leaseToken string,
 ) error {
 	if c.issqlite {
 		c.mu.Lock()
@@ -485,26 +491,28 @@ func (c *callSQLStrategy) doneAsync(
 
 	now := time.Now()
 
-	tx, err := c.db.Begin()
+	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 
+	defer tx.Rollback()
+	if leaseToken == "" {
+		return ErrJobLeaseLost
+	}
+	guard := " WHERE key=? AND status=1 AND lease_token=? AND leased_until>?"
+	guardArgs := []any{key, leaseToken, now}
 	if meta.TTL != nil {
-		_, err = tx.ExecContext(ctx, `
-	UPDATE executions
-	SET status = ?, ttl = ?, output = ?, error = ?, updated_at = ?
-	WHERE key = ?
-	`, status, meta.TTL, outjson, errjson, now, key)
+		args := append([]any{status, meta.TTL, outjson, errjson, now}, guardArgs...)
+		result, updateErr := tx.ExecContext(ctx, `UPDATE executions SET status=?,ttl=?,output=?,error=?,updated_at=?,lease_token=NULL,leased_until=NULL`+guard, args...)
+		err = requireLeaseMutation(result, updateErr)
 		if err != nil {
 			return err
 		}
 	} else {
-		_, err = tx.ExecContext(ctx, `
-	UPDATE executions
-	SET status = ?, ttl = ?, updated_at = ?
-	WHERE key = ?
-	`, status, meta.TTL, now, key)
+		args := append([]any{status, meta.TTL, now}, guardArgs...)
+		result, updateErr := tx.ExecContext(ctx, `UPDATE executions SET status=?,ttl=?,updated_at=?,lease_token=NULL,leased_until=NULL`+guard, args...)
+		err = requireLeaseMutation(result, updateErr)
 		if err != nil {
 			return err
 		}

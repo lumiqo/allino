@@ -11,44 +11,43 @@ import (
 	"go.uber.org/zap"
 )
 
-type jobProgress struct {
-	Current int
-	Total   int
-}
+type jobProgress struct{ Current, Total int }
 
 type jobManager struct {
-	handlers *jobset
-	//handlerOptMap        map[string]*Option
+	handlers               *jobset
+	handlerOptions         sync.Map
 	lockedHandlers         *jobset
 	resourcelockedHandlers *jobset
 	dequeueThroughputEMA   *ema.EMACalculator
-
-	activeJobs int64 // 実行中ジョブ数
-	attempt    int64 // dequeue 失敗回数
-
-	waiting atomic.Bool
-	doneCh  chan struct{} // 完了通知
-
-	inited  sync.Once
-	queueCh chan func()
+	// Serialize dequeue metadata and per-handler interval state across worker slots.
+	dequeueMu  sync.Mutex
+	activeJobs int64
+	attempt    int64
+	waiting    atomic.Bool
+	doneCh     chan struct{}
+	inited     sync.Once
+	queueCh    chan func()
+	ctx        context.Context
 }
 
 func newJobManager() *jobManager {
-	return &jobManager{
-		handlers: newJobset(),
-		//handlerOptMap:        make(map[string]*Option),
-		lockedHandlers:         newJobset(),
-		resourcelockedHandlers: newJobset(),
-		dequeueThroughputEMA:   ema.NewEMACalculator(0.3),
-		doneCh:                 make(chan struct{}),
-		queueCh:                make(chan func()),
-	}
+	return &jobManager{handlers: newJobset(), lockedHandlers: newJobset(), resourcelockedHandlers: newJobset(), dequeueThroughputEMA: ema.NewEMACalculator(0.3), doneCh: make(chan struct{}), queueCh: make(chan func())}
+}
+
+// Register the options before making a handler available to SQL workers.
+func (jobm *jobManager) registerHandler(name string, opt *Option) {
+	jobm.handlerOptions.Store(name, opt)
+	jobm.handlers.Add(name)
 }
 
 func (jobm *jobManager) Init(sv *Server) {
 	jobm.inited.Do(func() {
-		numgoroutine := sv.Config.JobConfig.Concurrency
-		for i := 0; i < numgoroutine; i++ {
+		jobm.ctx = sv.appctx
+		concurrency := sv.Config.JobConfig.Concurrency
+		if concurrency < 1 {
+			concurrency = 1
+		}
+		for i := 0; i < concurrency; i++ {
 			go func() {
 				for {
 					select {
@@ -63,214 +62,215 @@ func (jobm *jobManager) Init(sv *Server) {
 	})
 }
 
-func (jobm *jobManager) Do(fn func()) {
-	jobm.queueCh <- fn
+// Do waits for an execution slot, without leaving a sender blocked on shutdown.
+func (jobm *jobManager) Do(fn func()) bool {
+	select {
+	case <-jobm.ctx.Done():
+		return false
+	default:
+	}
+	select {
+	case <-jobm.ctx.Done():
+		return false
+	case jobm.queueCh <- fn:
+		return true
+	}
 }
-
+func waitJobContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
 func (jobm *jobManager) WorkerInit(s callStrategy, sv *Server) {
 	jobm.Init(sv)
-	//idleit := sv.Config.JobConfig.IdleInterval
-	//leasesec := int(mergeSingle(sv.Config.JobConfig.LeaseSeconds, opt.Job.LeaseSeconds).Seconds())
-
-	leaset := sv.Config.JobConfig.LeaseDuration
-
-	//jobchan := make(chan JobTask, sv.Config.JobConfig.Concurrency*2)
-
 	backoff := NewBackoff(100*time.Millisecond, sv.Config.JobConfig.IdleInterval)
-
 	go func() {
+		// Dequeue runs inside the shared worker pool: a queued job is never leased
+		// while waiting behind another SQL or Redis task for an execution slot.
+		for jobm.Do(func() { jobm.pollAndRun(s, sv, backoff) }) {
+		}
+	}()
+}
+func (jobm *jobManager) pollAndRun(s callStrategy, sv *Server, backoff *Backoff) {
+	if sv.appctx.Err() != nil {
+		return
+	}
+	jobm.dequeueMu.Lock()
+	hs := jobm.handlers.Diff(jobm.lockedHandlers, jobm.resourcelockedHandlers)
+	jtask, err := s.Dequeue(sv.appctx, hs, sv.Config.JobConfig.LeaseDuration, jobm.dequeueThroughputEMA)
+	if err != nil {
+		attempts := atomic.AddInt64(&jobm.attempt, 1)
+		jobm.dequeueMu.Unlock()
+		if !errors.Is(err, ErrJobNotFound) && sv.appctx.Err() == nil {
+			sv.Logger.Error("job system error", zap.String("component", "dequeue"), zap.Error(err))
+		}
+		if jobm.waiting.Load() {
+			jobm.tryFinish()
+		}
+		waitJobContext(sv.appctx, backoff.Duration(int(attempts)))
+		return
+	}
+	jtask.Meta().ParentID = jtask.Key()
+	if jtask.Meta().RootID == "" {
+		jtask.Meta().RootID = jtask.Key()
+	}
+	value, _ := jobm.handlerOptions.Load(jtask.Handler())
+	opt := value.(*Option)
+	var delay time.Duration
+	if opt.Job.Interval != 0 {
+		jobm.lockedHandlers.Add(jtask.Handler())
+		if opt.lastRun != nil {
+			delay = time.Until(opt.lastRun.Add(time.Duration(float64(opt.Job.Interval) * jobm.dequeueThroughputEMA.CurrentAverage)))
+		}
+	}
+	atomic.StoreInt64(&jobm.attempt, 0)
+	atomic.AddInt64(&jobm.activeJobs, 1)
+	jobm.dequeueMu.Unlock()
+	jobm.runTask(sv, opt, jtask, delay)
+}
+func (jobm *jobManager) runTask(sv *Server, opt *Option, jtask JobTask, delay time.Duration) {
+	scheduledAt := time.Now()
+	ctx, cancel := context.WithCancel(sv.appctx)
+	var leaseLost atomic.Bool
+	heartbeatDone := make(chan struct{})
+	heartbeatInterval := sv.Config.JobConfig.LeaseDuration / 2
+	if heartbeatInterval <= 0 {
+		heartbeatInterval = time.Millisecond
+	}
+	go func() {
+		defer close(heartbeatDone)
+		ticker := time.NewTicker(heartbeatInterval)
+		defer ticker.Stop()
 		for {
 			select {
-			case <-sv.appctx.Done():
+			case <-ctx.Done():
 				return
-			default:
-				hs := jobm.handlers.Diff(jobm.lockedHandlers, jobm.resourcelockedHandlers)
-				jtask, err := s.Dequeue(sv.appctx, hs, leaset, jobm.dequeueThroughputEMA)
-				if err != nil {
-					if !errors.Is(err, ErrJobNotFound) {
-						sv.Logger.Error("job system error", zap.String("component", "dequeue"), zap.Error(err))
+			case <-ticker.C:
+				if err := jtask.HeartBeat(ctx, sv.Config.JobConfig.LeaseDuration); err != nil {
+					if !sv.Config.Log.Silent {
+						sv.Logger.Error("job system error", zap.String("component", "leaseupdate"), zap.Error(err))
 					}
-
-					wait := backoff.Duration(int(atomic.AddInt64(&jobm.attempt, 1)))
-					if jobm.waiting.Load() {
-						jobm.tryFinish()
+					if errors.Is(err, ErrJobLeaseLost) {
+						leaseLost.Store(true)
+						cancel()
+						return
 					}
-					time.Sleep(wait)
-					continue
 				}
-
-				jtask.Meta().ParentID = jtask.Key()
-				if jtask.Meta().RootID == "" {
-					jtask.Meta().RootID = jtask.Key()
-				}
-
-				// if dequeued need handler lock,
-				opt := sv.handlerOptMap[jtask.Handler()]
-				if opt.Job.Interval != 0 {
-					jobm.lockedHandlers.Add(jtask.Handler())
-				}
-
-				atomic.StoreInt64(&jobm.attempt, 0)
-				//jobchan <- jtask
-
-				jobm.Do(func() {
-
-					now := time.Now()
-					opt := sv.handlerOptMap[jtask.Handler()]
-
-					// check if need to re-dispatch
-					needDispatch := false
-					var waitDur time.Duration
-					if opt.Job.Interval != 0 && opt.lastRun != nil {
-						waitDur = time.Until((*opt.lastRun).Add(time.Duration(float64(opt.Job.Interval) * jobm.dequeueThroughputEMA.CurrentAverage)))
-						if waitDur > 0 {
-							needDispatch = true
-						}
-					}
-
-					task := sv.TimeWheel.Add(time.Duration(leaset/2), func() bool {
-						err := jtask.HeartBeat(sv.appctx, leaset)
-						//err := s.LeaseUpdate(sv.appctx, jobn.key, leaset)
-						if err != nil && !sv.Config.Log.Silent {
-							sv.Logger.Error("job system error", zap.String("component", "leaseupdate"), zap.Error(err))
-						}
-						return true
-					})
-
-					atomic.AddInt64(&jobm.activeJobs, 1)
-					fn := func() bool {
-						defer func() {
-							atomic.AddInt64(&jobm.activeJobs, -1)
-							if jobm.waiting.Load() {
-
-								jobm.tryFinish()
-							}
-						}()
-
-						r := NewRuntime(sv, nil)
-						defer r.do_defer()
-						r.cache.requestid = jtask.Key()
-						r.cache.req_type = REQUEST_JOB
-						r.cache.parentjobid = jtask.Meta().ParentID
-						r.cache.rootjobid = jtask.Meta().RootID
-
-						if !r.config.Log.Silent {
-							r.logger.Info("job started", zap.String("handler", jtask.Handler()), zap.String("requestid", jtask.Key()))
-						}
-						_, outjson, errjson, syserr := opt.invoker(r, jtask.Handler(), jtask.Meta().Version, jtask.Input(), false, nil)
-						if syserr != nil {
-							if !r.config.Log.Silent {
-								r.logger.Error("job failed", zap.String("handler", jtask.Handler()), zap.String("requestid", jtask.Key()), zap.Error(syserr))
-							}
-
-							err := jtask.Fail(sv.appctx)
-							//err := s.Free(sv.appctx, jtask.Key())
-							if err != nil && !r.config.Log.Silent {
-								r.logger.Error("job system error", zap.String("component", "dequeue/syserr"), zap.Error(err))
-							}
-						} else if r.memo.jobabortctrl != "" {
-							// cancel if abort or error
-							if !r.config.Log.Silent {
-								r.logger.Info("job requeued", zap.String("handler", jtask.Handler()), zap.String("requestid", jtask.Key()))
-							}
-
-							err := jtask.Requeue(sv.appctx, requeueDelay(r))
-							//err := s.Requeue(sv.appctx, jtask.Key(), requeueDelay(r))
-							if err != nil && !r.config.Log.Silent {
-								r.logger.Error("job system error", zap.String("component", "dequeue/requeue"), zap.Error(err))
-							}
-						} else if opt.Job.Cache {
-
-							//var ttl *time.Time
-							if opt.Job.CacheExpire != 0 {
-								ttlb := time.Now().Add(opt.Job.CacheExpire)
-								//ttl = &ttlb
-
-								jtask.Meta().TTL = &ttlb
-							}
-
-							// store if cache or dedupe
-							if !r.config.Log.Silent {
-								r.logger.Info("job completed/cached", zap.String("handler", jtask.Handler()), zap.String("requestid", jtask.Key()))
-							}
-
-							err := jtask.Success(sv.appctx, jtask.Handler(), jtask.Meta(), jtask.Key(), jtask.Input(), outjson, errjson)
-							//err := s.DoneAsync(sv.appctx, jtask.Key(), ttl, outjson, errjson)
-							if err != nil && !r.config.Log.Silent {
-								r.logger.Error("job system error", zap.String("component", "dequeue/doneasync"), zap.Error(err))
-							}
-						} else {
-							if !r.config.Log.Silent {
-								r.logger.Info("job completed", zap.String("handler", jtask.Handler()), zap.String("requestid", jtask.Key()))
-							}
-
-							err := jtask.Fail(sv.appctx)
-							//err := s.Free(sv.appctx, jtask.Key())
-							if err != nil && !r.config.Log.Silent {
-								r.logger.Error("job system error", zap.String("component", "dequeue/etc"), zap.Error(err))
-							}
-						}
-						task.Cancel()
-						if needDispatch {
-							jobm.lockedHandlers.Remove(jtask.Handler())
-							opt.lastRun = &now
-						}
-						return false
-					}
-
-					if needDispatch {
-						sv.TimeWheel.Add(waitDur, fn)
-					} else {
-						fn()
-						jobm.lockedHandlers.Remove(jtask.Handler())
-						opt.lastRun = &now
-					}
-				})
 			}
 		}
 	}()
-
+	var started time.Time
+	defer func() {
+		cancel()
+		<-heartbeatDone
+		jobm.dequeueMu.Lock()
+		if opt.Job.Interval != 0 {
+			if !started.IsZero() {
+				opt.lastRun = &started
+			}
+			jobm.lockedHandlers.Remove(jtask.Handler())
+		}
+		atomic.AddInt64(&jobm.activeJobs, -1)
+		jobm.dequeueMu.Unlock()
+		if jobm.waiting.Load() {
+			jobm.tryFinish()
+		}
+	}()
+	// Keep the execution slot and heartbeat while respecting the handler interval.
+	// A delayed callback must not later run outside the configured worker limit.
+	if delay > 0 && !waitJobContext(ctx, delay) {
+		return
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	// Preserve interval accounting from when this slot accepted the task.
+	started = scheduledAt
+	r := NewRuntime(sv, nil)
+	r.ctx = ctx
+	defer r.do_defer()
+	r.cache.requestid = jtask.Key()
+	r.cache.req_type = REQUEST_JOB
+	r.cache.parentjobid = jtask.Meta().ParentID
+	r.cache.rootjobid = jtask.Meta().RootID
+	if !r.config.Log.Silent {
+		r.logger.Info("job started", zap.String("handler", jtask.Handler()), zap.String("requestid", jtask.Key()))
+	}
+	_, outjson, errjson, syserr := opt.invoker(r, jtask.Handler(), jtask.Meta().Version, jtask.Input(), false, nil)
+	if leaseLost.Load() || ctx.Err() != nil {
+		return
+	}
+	var err error
+	event := "job completed"
+	switch {
+	case syserr != nil:
+		event = "job failed"
+		if !r.config.Log.Silent {
+			r.logger.Error("job failed", zap.String("handler", jtask.Handler()), zap.Error(syserr))
+		}
+		err = jtask.Fail(ctx)
+	case r.memo.jobabortctrl == JOB_ABORT_REQUEUE || r.memo.jobabortctrl == JOB_ABORT_REQUEUE_AT:
+		event = "job requeued"
+		err = jtask.Requeue(ctx, requeueDelay(r))
+	case r.memo.jobabortctrl == JOB_ABORT:
+		event = "job aborted"
+		err = jtask.Fail(ctx)
+	case opt.Job.Cache:
+		event = "job completed/cached"
+		if opt.Job.CacheExpire != 0 {
+			ttl := time.Now().Add(opt.Job.CacheExpire)
+			jtask.Meta().TTL = &ttl
+		}
+		err = jtask.Success(ctx, jtask.Handler(), jtask.Meta(), jtask.Key(), jtask.Input(), outjson, errjson)
+	default:
+		err = jtask.Fail(ctx)
+	}
+	if !r.config.Log.Silent {
+		if err != nil {
+			r.logger.Error("job system error", zap.String("component", "completion"), zap.Error(err))
+		} else {
+			r.logger.Info(event, zap.String("handler", jtask.Handler()), zap.String("requestid", jtask.Key()))
+		}
+	}
 }
 
 func (jobm *jobManager) tryFinish() {
-	if atomic.LoadInt64(&jobm.activeJobs) == 0 &&
-		atomic.LoadInt64(&jobm.attempt) >= 5 {
-
+	if atomic.LoadInt64(&jobm.activeJobs) == 0 && atomic.LoadInt64(&jobm.attempt) >= 5 {
 		select {
 		case jobm.doneCh <- struct{}{}:
 		default:
 		}
 	}
 }
-
 func (jobm *jobManager) WaitForJob(ctx context.Context, c callStrategy, jobid string, progressf func(doneCount, errCount, total int)) error {
 	jobm.waiting.Store(true)
-
-	ticker := time.NewTicker(1 * time.Second)
+	defer jobm.waiting.Store(false)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 	tickerfn := func() {
-		statusCountMap, err := c.Total(ctx, "*")
-		if err == nil {
-			if progressf != nil {
-				total := 0
-				for _, v := range statusCountMap {
-					total += v
-				}
-				progressf(statusCountMap["done"], statusCountMap["error"], total)
+		counts, err := c.Total(ctx, "*")
+		if err == nil && progressf != nil {
+			total := 0
+			for _, v := range counts {
+				total += v
 			}
+			progressf(counts["done"], counts["error"], total)
 		}
 	}
-	defer ticker.Stop()
 	for {
 		select {
 		case <-jobm.doneCh:
 			tickerfn()
-			jobm.waiting.Store(false)
 			return nil
 		case <-ctx.Done():
 			tickerfn()
 			return ctx.Err()
 		case <-ticker.C:
-			// 👇ここで定期処理
 			tickerfn()
 		}
 	}

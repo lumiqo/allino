@@ -38,14 +38,15 @@ func callSQLInit(s *Server, opt *Option) error {
 		if s.callSQLStrategy == nil {
 			s.callSQLStrategy = newcallSQLStrategy(s)
 			err := s.callSQLStrategy.Init(s.appctx, (s.Config.SQL.AllowMigrate != nil && *s.Config.SQL.AllowMigrate))
-			if err != nil && !s.Config.Log.Silent {
-				s.Logger.Error("job system error", zap.String("component", "register"), zap.Error(err))
+			if err != nil {
+				s.callSQLStrategy = nil
+				return err
 			}
 			s.jobManager.WorkerInit(s.callSQLStrategy, s)
 
 			// Reaping
 			s.TimeWheel.Add(s.Config.JobConfig.LeaseDuration, func() bool {
-				err = s.callSQLStrategy.Reaping(s.appctx)
+				err := s.callSQLStrategy.Reaping(s.appctx)
 				if err != nil && !s.Config.Log.Silent {
 					s.Logger.Error("job system error", zap.String("component", "reaping"), zap.Error(err))
 				}
@@ -53,7 +54,7 @@ func callSQLInit(s *Server, opt *Option) error {
 			})
 		}
 
-		s.jobManager.handlers.Add(encodeHandlerName(opt))
+		s.jobManager.registerHandler(encodeHandlerName(opt), opt)
 	}
 
 	return nil

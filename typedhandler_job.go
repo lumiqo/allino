@@ -73,6 +73,9 @@ var JobExtension = NewExtension[any, any](
 					zap.Error(err),
 				)
 			}
+			if err != nil {
+				return err
+			}
 			err = callRedisInit(s, opt)
 			if err != nil && !s.Config.Log.Silent {
 				s.Logger.Warn(
