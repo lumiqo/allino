@@ -3,6 +3,9 @@ package allino
 import "go.uber.org/zap"
 
 func callSQLInit(s *Server, opt *Option) error {
+	if err := validateResourceOptions(opt); err != nil {
+		return err
+	}
 	sqlneed := false
 	switch opt.JobMode {
 	case JOBMODE_ASYNC:

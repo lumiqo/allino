@@ -116,7 +116,10 @@ func (c *callSQLStrategy) Init(ctx context.Context, allow_migrate bool) error {
 	}
 
 	if !allow_migrate {
-		return c.migrateLeaseToken(ctx, false)
+		if err := c.migrateLeaseToken(ctx, false); err != nil {
+			return err
+		}
+		return c.migrateJobResources(ctx, false)
 	}
 
 	// 0:queued 1:leased 2:done 3:error
@@ -232,7 +235,10 @@ ON executions(key);
 	if err != nil {
 		return err
 	}
-	return c.migrateLeaseToken(ctx, true)
+	if err := c.migrateLeaseToken(ctx, true); err != nil {
+		return err
+	}
+	return c.migrateJobResources(ctx, true)
 }
 
 func (c *callSQLStrategy) Enqueue(
@@ -250,22 +256,25 @@ func (c *callSQLStrategy) Enqueue(
 
 	now := time.Now()
 
-	//res, err := c.db.ExecContext(ctx, `
-	//INSERT OR IGNORE INTO executions
-	//(key, handler, version, status, parentid, rootid, priority, ttl, created_at, updated_at, run_at, input)
-	//VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	//`, key, handler, meta.Version, meta.Status, meta.ParentID, meta.RootID, meta.Priority, meta.TTL, now, now, now, injson)
-
-	// 0:queued 1:leased 2:done 3:error
-	res, err := c.db.ExecContext(ctx, `
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if err = registerResourcePolicy(ctx, tx, meta, now); err != nil {
+		return false, err
+	}
+	res, err := tx.ExecContext(ctx, `
 INSERT INTO executions
-(key, handler, version, status, parentid, rootid, priority, ttl, created_at, updated_at, run_at, input)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+(key, handler, version, status, parentid, rootid, priority, ttl, created_at, updated_at, run_at, input,resource_key)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 
 ON CONFLICT(key) DO UPDATE SET
 	handler=excluded.handler,
 	version=excluded.version,
 	status=excluded.status,
+ resource_key=excluded.resource_key,
+ resource_started_at=NULL,
  lease_token=NULL,
  leased_until=NULL,
 	parentid=excluded.parentid,
@@ -276,10 +285,10 @@ ON CONFLICT(key) DO UPDATE SET
 	input=excluded.input,
 	updated_at=excluded.updated_at
 
-WHERE executions.status=2 -- done
-  AND executions.ttl < ?
+WHERE (executions.status=2 AND executions.ttl < ?)
+ OR (? AND executions.status IN (2,3))
 `, key, handler, meta.Version, meta.Status, meta.ParentID, meta.RootID,
-		meta.Priority, meta.TTL, now, now, now, injson, now)
+		meta.Priority, meta.TTL, now, now, now.Add(time.Duration(delay_sec)*time.Second), injson, meta.ResourceKey, now, meta.refresh)
 
 	if err != nil {
 		return false, err
@@ -290,6 +299,9 @@ WHERE executions.status=2 -- done
 		return false, err
 	}
 
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
 	if rows > 0 {
 		return true, nil
 	}
@@ -348,6 +360,7 @@ func (c *callSQLStrategy) Dequeue(
 		args = append(args, h) // handler IN (...)
 	}
 
+	args = append(args, now, now, now)
 	//optimizeWhere := ""
 
 	//if !c.issqlite {
@@ -362,16 +375,26 @@ SET
   status = 1, -- leased
   leased_until = ?,
   lease_token = ?,
+  resource_started_at = NULL,
   updated_at = ?
 WHERE id = (
   SELECT id
-  FROM executions
-  WHERE status = 0 AND run_at <= ? AND handler IN (%s) -- queued
-  ORDER BY priority DESC, created_at ASC, id ASC
+  FROM executions AS candidate
+  WHERE candidate.status = 0 AND candidate.run_at <= ? AND candidate.handler IN (%s)
+  AND (candidate.resource_key='' OR (
+    EXISTS (SELECT 1 FROM job_resources AS resource WHERE resource.resource_key=candidate.resource_key
+      AND resource.next_start_at<=?
+      AND (resource.max_concurrent=0 OR
+        (SELECT COUNT(*) FROM executions AS active WHERE active.resource_key=candidate.resource_key
+         AND active.status=1 AND active.leased_until>?) < resource.max_concurrent))
+    AND NOT EXISTS (SELECT 1 FROM executions AS pending WHERE pending.resource_key=candidate.resource_key
+      AND pending.status=1 AND pending.leased_until>? AND pending.resource_started_at IS NULL)
+  ))
+  ORDER BY candidate.priority DESC, candidate.created_at ASC, candidate.id ASC
   LIMIT 1
 )
 RETURNING
-  id, key, handler, version, status, parentid, rootid, input
+  id, key, handler, version, status, parentid, rootid, input,resource_key
 `, strings.Join(placeholders, ","))
 
 	row := tx.QueryRowContext(ctx, q, args...)
@@ -385,6 +408,7 @@ RETURNING
 		&meta.ParentID,
 		&meta.RootID,
 		&injson,
+		&meta.ResourceKey,
 	); err != nil {
 
 		// UPDATE が 0件なら RETURNING も 0行 -> sql.ErrNoRows
@@ -438,7 +462,7 @@ func (c *callSQLStrategy) Reaping(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE executions SET status=0,leased_until=NULL,lease_token=NULL,
+	_, err = tx.ExecContext(ctx, `UPDATE executions SET status=0,leased_until=NULL,lease_token=NULL,resource_started_at=NULL,
  updated_at=?,retry_count=COALESCE(retry_count,0)+1 WHERE status=1 AND leased_until<?`, now, now)
 	if err != nil {
 		return err
@@ -522,11 +546,17 @@ func (c *callSQLStrategy) doneAsyncWithLease(
 	(key, handler, version, status, parentid, rootid, ttl, input, output, error, created_at, updated_at)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(key) DO UPDATE SET
+		ttl = excluded.ttl,
+		version = excluded.version,
 		output = excluded.output,
 		error = excluded.error,
 		status = excluded.status,
 		updated_at = excluded.updated_at
+	WHERE executions_results.status<>2 OR excluded.status=2
 	`, key, handler, meta.Version, status, meta.ParentID, meta.RootID, meta.TTL, injson, outjson, errjson, now, now)
+	}
+	if err == nil && meta.TTL != nil && errjson == nil {
+		err = saveCacheSnapshot(ctx, tx, handler, meta, key, injson, outjson, now)
 	}
 	//a, b := res.RowsAffected()
 	//fmt.Println("doneasync", a, b)
@@ -723,38 +753,59 @@ func (c *callSQLStrategy) Done(
 
 	now := time.Now()
 
-	var err error
-	if injson != nil {
-
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
 	}
+	defer tx.Rollback()
 
 	if meta.TTL != nil {
-		_, err = c.db.ExecContext(ctx, `
+		_, err = tx.ExecContext(ctx, `
 	INSERT INTO executions
-	(key, handler, version, status, parentid, rootid, ttl, input, output, error, created_at, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	(key, handler, version, status, parentid, rootid, ttl, input, output, error, created_at, updated_at, priority, run_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(key) DO UPDATE SET
+		ttl = excluded.ttl,
+		version = excluded.version,
 		output = excluded.output,
 		error = excluded.error,
 		status = excluded.status,
 		updated_at = excluded.updated_at
-	`, key, handler, meta.Version, status, meta.ParentID, meta.RootID, meta.TTL, injson, outjson, errjson, now, now)
+	`, key, handler, meta.Version, status, meta.ParentID, meta.RootID, meta.TTL, injson, outjson, errjson, now, now, meta.Priority, now)
 
 	} else {
-		_, err = c.db.ExecContext(ctx, `
+		_, err = tx.ExecContext(ctx, `
 	INSERT INTO executions_results
 	(key, handler, version, status, parentid, rootid, ttl, input, output, error, created_at, updated_at)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(key) DO UPDATE SET
+		ttl = excluded.ttl,
+		version = excluded.version,
 		output = excluded.output,
 		error = excluded.error,
 		status = excluded.status,
 		updated_at = excluded.updated_at
+	WHERE executions_results.status<>2 OR excluded.status=2
 	`, key, handler, meta.Version, status, meta.ParentID, meta.RootID, meta.TTL, injson, outjson, errjson, now, now)
 
 	}
 
-	return err
+	if err != nil {
+		return err
+	}
+	if meta.TTL == nil {
+		// Synchronous memoized calls also own an executions row. Complete it
+		// independently of the retained successful result.
+		if _, err := tx.ExecContext(ctx, `UPDATE executions SET status=?,output=?,error=?,version=?,updated_at=?,lease_token=NULL,leased_until=NULL WHERE key=? AND status=1`, status, outjson, errjson, meta.Version, now, key); err != nil {
+			return err
+		}
+	}
+	if meta.TTL != nil && errjson == nil {
+		if err := saveCacheSnapshot(ctx, tx, handler, meta, key, injson, outjson, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (c *callSQLStrategy) List(
@@ -785,7 +836,7 @@ func (c *callSQLStrategy) List(
 	args = append(args, limit, offset)
 
 	query := `
-	SELECT key, handler, version, status, parentid, rootid, priority, ttl, created_at, updated_at, leased_until, retry_count
+	SELECT key, handler, version, status, parentid, rootid, priority, ttl, created_at, updated_at, leased_until, retry_count,resource_key
 	FROM executions
 	` + where + `
 	ORDER BY created_at DESC
@@ -816,6 +867,7 @@ func (c *callSQLStrategy) List(
 			&ji.UpdatedAt,
 			&ji.LeasedUntil,
 			&ji.RetryCount,
+			&ji.Meta.ResourceKey,
 		); err != nil {
 			return nil, err
 		}
@@ -847,6 +899,8 @@ func (c *callSQLStrategy) requeue(ctx context.Context, key string, delay_sec int
     status = 0, -- queued
     run_at = ?,
     leased_until = NULL,
+    lease_token = NULL,
+    resource_started_at = NULL,
     updated_at = ?,
 		retry_count = COALESCE(retry_count, 0) + 1
   WHERE key = ?

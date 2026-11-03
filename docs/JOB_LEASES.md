@@ -44,27 +44,20 @@ writes/deletes/requeues/heartbeats, key reuse, persistent and TTL results, retry
 limits, and migration preserving queued data. Tests use an isolated SQLite DB
 and do not require Redis or Chrome.
 
-At the time of this change the checkout's existing `z_dashboard_api_test.go`
-imports a missing `dashboard/api` package, so plain `go test ./...` cannot load
-all tests. The focused tests can be run without editing that existing test:
+The obsolete dashboard test that referenced the removed `dashboard/api` package
+has been removed. The standard commands now load the suite without an overlay:
 
-```bash
-mapfile -t job_sources < <(find . -maxdepth 1 -name '*.go' ! -name '*_test.go' -print)
-go test -race "${job_sources[@]}" job_worker_lease_test.go
+```sh
+go test ./...
+go test -race . -run 'TestWorker|TestResource'
+go vet ./...
 ```
 
-The full package build can be checked with `go build ./...`. SQLite is the backend
-covered here; no claim of validation against another SQL dialect is made.
-
-Validation performed for this change:
-
-- `go build ./...`: passed.
-- The 10 focused worker/lease tests above: passed with `-race`.
-- Existing `TestJob*` tests and the new `TestWorker*` tests across packages:
-  passed using a temporary Go overlay to exclude only the missing-dashboard
-  test. Redis-dependent tests were skipped because Redis was unavailable.
-- `go vet ./...`: passed with the same temporary overlay.
+SQLite is the backend covered here; no claim of validation against another SQL
+dialect is made. Redis-dependent tests skip when Redis is unavailable.
 
 No application database was migrated during development; migration tests used
 throwaway databases. Browser-profile locking, scraper-specific cache keys and
 retry/error classification remain integration work for the scraper handlers.
+
+Resource-key scheduling is described in [JOB_RESOURCES.md](JOB_RESOURCES.md).

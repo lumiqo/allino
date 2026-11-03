@@ -52,6 +52,9 @@ type JobOption struct {
 	Priority      int
 	CacheExpire   time.Duration
 	Interval      time.Duration
+	// Resource limits apply to queued async/dispatch jobs whose input implements ResourceRequest.
+	MinInterval              time.Duration
+	MaxConcurrentPerResource int
 
 	OnInputUpgrade  func(version string, old_input_at time.Time, old_input []byte) (bool, any)                     `json:"-"`
 	OnOutputUpgrade func(version string, old_output_at time.Time, old_output, old_error []byte) (bool, any, error) `json:"-"`
@@ -214,7 +217,7 @@ func (rw *GenericFunction[T, U, E]) call_job(r *Runtime, input T, fromcall bool)
 
 	var zeroU U
 	opt := rw.options
-	asyncExec := fromcall && rw.options.Job.Async
+	asyncExec := (fromcall || resourceLimitsEnabled(opt.Job)) && rw.options.Job.Async
 	dedupeExec := rw.options.Job.Dedupe
 	cacheExec := rw.options.Job.Cache
 
@@ -238,7 +241,7 @@ func (rw *GenericFunction[T, U, E]) call_job(r *Runtime, input T, fromcall bool)
 	var syserr error
 
 	unmarshalfn := unmarshalfnMake[U, E](r, opt, rw.upool, rw.epool, jec.Handler())
-	if cacheExec {
+	if cacheExec && !r.memo.jobRefresh {
 		output, err, syserr = unmarshalfn(c.Hit(r.Context(), jec.Handler(), opt.Job.CacheExpire != 0, jec.JobID(), jec.InputJSON()))
 
 		if syserr == nil {
@@ -289,6 +292,13 @@ func (rw *GenericFunction[T, U, E]) call_job(r *Runtime, input T, fromcall bool)
 		}
 
 		if !aquiredLock {
+			if cacheExec && r.memo.jobRefresh {
+				output, err, syserr = unmarshalfn(c.Wait(r.Context(), jec.JobID(), true, r.server.TimeWheel))
+				if syserr != nil {
+					return zeroU, syserr
+				}
+				return output, err
+			}
 			if cacheExec {
 				output, err, syserr = unmarshalfn(c.Hit(r.Context(), jec.Handler(), opt.Job.CacheExpire != 0, jec.JobID(), jec.InputJSON()))
 				if syserr == nil {
@@ -447,6 +457,10 @@ func (rw *GenericFunction[T, U, E]) invokeFunctionJSON(r *Runtime, handler, vers
 		}
 	}
 
+	if direct && resourceLimitsEnabled(rw.options.Job) {
+		outJSON, errJSON, syserr := marshalOutputSet[U, E](rw.call_job(r, input, true))
+		return key, outJSON, errJSON, syserr
+	}
 	outJSON, errJSON, syserr := marshalOutputSet[U, E](rw.handlefunc(r, input))
 	return key, outJSON, errJSON, syserr
 }

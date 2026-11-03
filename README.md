@@ -176,6 +176,11 @@ var ExpensiveLookup = allino.NewFunction(
 )
 ```
 
+`Function.CallCache(r, input)` reads a saved successful result without executing
+the function, including expired results, and returns cache state and timestamps.
+`Function.CallRefresh(r, input)` explicitly refreshes using the existing JobMode.
+See [cache reads and refreshes](docs/CALL_CACHE.md) for usage and retention semantics.
+
 Supported modes include:
 
 - `cache`: store and reuse results by handler name, version, and input
@@ -184,6 +189,12 @@ Supported modes include:
 - `memoized`: wait for the first execution and reuse its result
 - `async` / `dispatch`: enqueue work and resume later
 - `fanout` / `replay` / `replayall`: Redis stream based broadcast/replay modes
+
+Queued SQL jobs also support resource-scoped scheduling through an input method
+`ResourceKey() string`. Set `Job.MinInterval` and/or
+`Job.MaxConcurrentPerResource` to coordinate domains, browser profiles or other
+shared resources across handlers and worker processes. See
+[resource scheduling](./docs/JOB_RESOURCES.md) for the interface and examples.
 
 These modes make allino especially handy for AI calls, external API aggregation,
 large batch registration, resumable workflows, and state restoration.
@@ -407,6 +418,8 @@ type Option struct {
 }
 type JobOption struct {
 	Priority int // optional. Priority of the handler's jobs. Higher values indicate higher priority.
+  MinInterval time.Duration // optional. Minimum interval per ResourceKey (async/dispatch only).
+  MaxConcurrentPerResource int // optional. Maximum live jobs per ResourceKey; 0 is unlimited.
   Interval time.Duration // optional. Approximate interval between executions (used in async/dispatch mode).
   CacheExpire time.Duration // optional. Cache expiration duration. Persistent if 0 (default).
 

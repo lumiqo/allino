@@ -355,16 +355,32 @@ func (rw *GenericFunction[T, U, E]) ErrorSchema() (*jsonino.Schema, error) {
 
 func (rw *GenericFunction[T, U, E]) Copy() Function {
 	opt := *rw.options
-	return &GenericFunction[T, U, E]{
-		options:    &opt,
-		handlefunc: rw.handlefunc,
-		handler:    rw.handler,
-	}
+	cp := *rw
+	cp.options = &opt
+	opt.lastRun = nil
+	opt.invoker = cp.invokeFunctionJSON
+	return &cp
 }
 
 func (rw *GenericFunction[T, U, E]) Call(r *Runtime, input T) (output U, err error) {
+	return rw.callWithRefresh(r, input, false)
+}
+
+// CallRefresh bypasses cached results and follows the function's JobMode.
+// Dispatch returns JobPendingError; memoized joins an existing execution.
+func (rw *GenericFunction[T, U, E]) CallRefresh(r *Runtime, input T) (output U, err error) {
+	if !rw.options.Job.Cache || rw.options.Session.Type != "" || rw.options.Job.CacheErrOnHit {
+		return output, fmt.Errorf("CallRefresh requires cache, memoized, or dispatch JobMode")
+	}
+	if r.server.callSQLStrategy == nil {
+		return output, fmt.Errorf("CallRefresh requires a configured job store")
+	}
+	return rw.callWithRefresh(r, input, true)
+}
+
+func (rw *GenericFunction[T, U, E]) callWithRefresh(r *Runtime, input T, refresh bool) (output U, err error) {
 	newR := *r // shallow copy (rは構造体)
-	newR.memo = requestMemo{}
+	newR.memo = requestMemo{jobRefresh: refresh}
 	//opt := rw.options
 	//if opt != nil && opt.Path != "" {
 	//	newR.loggerWith = r.Logger().With(zap.String("caller", opt.Path)) // 区別しやすく
@@ -398,6 +414,7 @@ func (rw *GenericFunction[T, U, E]) call_internal(r *Runtime, input T, fromcall 
 
 	if rw.options != nil &&
 		((fromcall && rw.options.Job.Async) ||
+			resourceLimitsEnabled(rw.options.Job) ||
 			rw.options.Job.Dedupe ||
 			rw.options.Job.Cache ||
 			r.memo.jobabortctrl != "") {

@@ -14,7 +14,7 @@ var ErrJobLeaseLost = errors.New("job lease lost")
 
 // migrateLeaseToken upgrades existing job tables without deleting queued work.
 // Schema inspection also makes the migration idempotent on existing databases.
-func (c *callSQLStrategy) leaseColumnExists(ctx context.Context) (bool, error) {
+func (c *callSQLStrategy) executionColumnExists(ctx context.Context, column string) (bool, error) {
 	rows, err := c.db.QueryContext(ctx, "SELECT * FROM executions WHERE 1=0")
 	if err != nil {
 		return false, err
@@ -25,14 +25,14 @@ func (c *callSQLStrategy) leaseColumnExists(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	for _, name := range columns {
-		if name == "lease_token" {
+		if name == column {
 			return true, nil
 		}
 	}
 	return false, nil
 }
 func (c *callSQLStrategy) migrateLeaseToken(ctx context.Context, allow bool) error {
-	exists, err := c.leaseColumnExists(ctx)
+	exists, err := c.executionColumnExists(ctx, "lease_token")
 	if err != nil {
 		return err
 	}
@@ -45,7 +45,7 @@ func (c *callSQLStrategy) migrateLeaseToken(ctx context.Context, allow bool) err
 	_, err = c.db.ExecContext(ctx, "ALTER TABLE executions ADD COLUMN lease_token TEXT")
 	if err != nil {
 		// Another server may have completed the same additive migration.
-		if exists, checkErr := c.leaseColumnExists(ctx); checkErr == nil && exists {
+		if exists, checkErr := c.executionColumnExists(ctx, "lease_token"); checkErr == nil && exists {
 			return nil
 		}
 	}
@@ -82,7 +82,7 @@ func (t *sqlJobTask) mutateLease(ctx context.Context, operation string, duration
 		return requireLeaseMutation(c.db.ExecContext(ctx, `DELETE FROM executions
    WHERE key=? AND status=1 AND lease_token=? AND leased_until>?`, t.key, t.leaseToken, now))
 	case "requeue":
-		return requireLeaseMutation(c.db.ExecContext(ctx, `UPDATE executions SET status=0,run_at=?,leased_until=NULL,lease_token=NULL,
+		return requireLeaseMutation(c.db.ExecContext(ctx, `UPDATE executions SET status=0,run_at=?,leased_until=NULL,lease_token=NULL,resource_started_at=NULL,
    updated_at=?,retry_count=COALESCE(retry_count,0)+1
    WHERE key=? AND status=1 AND lease_token=? AND leased_until>?`, now.Add(time.Duration(delay)*time.Second), now, t.key, t.leaseToken, now))
 	default:

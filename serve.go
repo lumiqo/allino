@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -97,6 +98,9 @@ type RoutingConfig struct {
 }
 
 type Server struct {
+	functionsInitOnce sync.Once
+	functionsInitErr  error
+
 	Config     *Config
 	Fiber      *fiber.App
 	Logger     *zap.Logger
@@ -676,7 +680,7 @@ WARNING: debug=true
 	}
 }
 
-func (s *Server) serveInitOnly() {
+func (s *Server) initializeFunctions() error {
 	if !s.Config.Log.Silent {
 		opts := s.RegisteredFunctions()
 		for _, opt := range opts {
@@ -690,13 +694,15 @@ func (s *Server) serveInitOnly() {
 	}
 
 	for _, ext := range s.extopts {
-		s.Logger.Info("extension init", zap.String("name", ext.Name))
+		if !s.Config.Log.Silent {
+			s.Logger.Info("extension init", zap.String("name", ext.Name))
+		}
 		if ext.OnFunctionInit != nil {
 			opts := s.RegisteredFunctions()
 			for _, opt := range opts {
 				err := ext.OnFunctionInit(s, NewRuntime(s, nil), opt)
 				if err != nil {
-					s.errorPrintln(fmt.Sprintf("OnHandlerInit error for Extension `%s` to path `%s`: ", ext.Name, opt.Path), err)
+					return fmt.Errorf("initialize extension %s for %s: %w", ext.Name, opt.Name, err)
 				}
 			}
 
@@ -704,10 +710,26 @@ func (s *Server) serveInitOnly() {
 				opt := h.Options()
 				err := ext.OnFunctionInit(s, NewRuntime(s, nil), opt)
 				if err != nil {
-					s.errorPrintln(fmt.Sprintf("OnHandlerInit error for Extension `%s` to path `%s`: ", ext.Name, opt.Path), err)
+					return fmt.Errorf("initialize extension %s for %s: %w", ext.Name, opt.Name, err)
 				}
 			}
 		}
+	}
+
+	return nil
+}
+
+// InitializeFunctions starts registered function backends without an HTTP listener.
+// Register functions before calling it. Initialization runs once per server.
+func (s *Server) InitializeFunctions() error {
+	s.functionsInitOnce.Do(func() { s.functionsInitErr = s.initializeFunctions() })
+	return s.functionsInitErr
+}
+
+func (s *Server) serveInitOnly() {
+	if err := s.InitializeFunctions(); err != nil {
+		s.errorPrintln("InitializeFunctions error: ", err)
+		return
 	}
 
 	if s.Config.OnServe != nil {

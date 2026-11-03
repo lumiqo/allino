@@ -3,6 +3,7 @@ package allino
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -189,6 +190,14 @@ func (jobm *jobManager) runTask(sv *Server, opt *Option, jtask JobTask, delay ti
 	if ctx.Err() != nil {
 		return
 	}
+	if starter, ok := jtask.(interface{ Start(context.Context) error }); ok {
+		if err := starter.Start(ctx); err != nil {
+			if !errors.Is(err, errResourceDeferred) && !sv.Config.Log.Silent {
+				sv.Logger.Error("job start failed", zap.String("handler", jtask.Handler()), zap.Error(err))
+			}
+			return
+		}
+	}
 	// Preserve interval accounting from when this slot accepted the task.
 	started = scheduledAt
 	r := NewRuntime(sv, nil)
@@ -259,12 +268,19 @@ func (jobm *jobManager) WaitForJob(ctx context.Context, c callStrategy, jobid st
 			for _, v := range counts {
 				total += v
 			}
-			progressf(counts["done"], counts["error"], total)
+			progressf(jobStatusCount(counts, statusDone), jobStatusCount(counts, statusError), total)
 		}
 	}
 	for {
 		select {
 		case <-jobm.doneCh:
+			counts, err := c.Total(ctx, "*")
+			if err != nil {
+				return err
+			}
+			if jobStatusCount(counts, statusQueued) > 0 || jobStatusCount(counts, statusLeased) > 0 {
+				continue
+			}
 			tickerfn()
 			return nil
 		case <-ctx.Done():
@@ -274,4 +290,11 @@ func (jobm *jobManager) WaitForJob(ctx context.Context, c callStrategy, jobid st
 			tickerfn()
 		}
 	}
+}
+
+func jobStatusCount(counts map[string]int, status int) int {
+	if count, ok := counts[sqlStatusCodeStrings[status]]; ok {
+		return count
+	}
+	return counts[strconv.Itoa(status)]
 }

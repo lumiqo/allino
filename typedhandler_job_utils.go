@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -47,12 +48,16 @@ type JobInfo struct {
 }
 
 type JobMeta struct {
-	Version  string
-	Status   int `json:"status"` // queued / leased / done / error
-	ParentID string
-	RootID   string
-	TTL      *time.Time
-	Priority int
+	refresh               bool
+	ResourceKey           string `json:"resource_key,omitempty"`
+	resourceMinInterval   time.Duration
+	resourceMaxConcurrent int
+	Version               string
+	Status                int `json:"status"` // queued / leased / done / error
+	ParentID              string
+	RootID                string
+	TTL                   *time.Time
+	Priority              int
 }
 
 type jobid struct {
@@ -212,6 +217,17 @@ func unmarshalOutputSet[U any, E error](version JobInfo, upool *ReflectPool[U], 
 
 	// error
 	if errJSON != nil {
+		// Interface errors cannot be directly instantiated by encoding/json.
+		if epool.ttype == reflect.TypeFor[error]() {
+			var decoded Error
+			if e := json.Unmarshal(errJSON, &decoded); e != nil {
+				return version, zeroU, nil, ErrJobErrorDecodeFailed.With(e)
+			}
+			if decoded.Msg == "" {
+				decoded.Msg = string(errJSON)
+			}
+			return version, zeroU, &decoded, nil
+		}
 
 		err, innererr := epool.New(func(a any) error {
 			return json.Unmarshal(errJSON, a)

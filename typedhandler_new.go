@@ -42,9 +42,11 @@ type Option struct {
 	Next []Function
 
 	// AI (experimental)
-	SystemPrompt string
-	Tools        []Function
-	MCP          string // "tool", "resource", "prompt"
+	SystemPrompt    string
+	Tools           []Function
+	MCP             string         // "tool", "resource", "prompt"
+	MCPInputSchema  map[string]any // Optional explicit schema for dynamic JSON inputs.
+	MCPOutputSchema map[string]any // Optional explicit schema for dynamic JSON outputs.
 
 	// Semantics
 	Package     string // optional: override auto package detection, used for route printing,

@@ -247,3 +247,37 @@ Frontmatter fields:
 | `description` | No | Returned by `prompts/list` and `prompts/get`. |
 
 If a mounted Markdown prompt has the same name as a Function prompt, the Function prompt takes precedence.
+
+## Custom transports
+
+Applications can reuse the MCP registry and dispatcher without routing through HTTP:
+
+```go
+s.RegisterAllFunction()
+if err := s.InitializeFunctions(); err != nil {
+    return err
+}
+r := allino.NewRuntime(s, nil).WithContext(ctx)
+response := s.DispatchMCP(r, allino.MCPRequest{
+    JSONRPC: "2.0",
+    ID: json.RawMessage(`"request-1"`),
+    Method: "tools/list",
+})
+```
+
+The application transport must authenticate and authorize callers. `WithContext`
+preserves an existing runtime's identity and metadata; it does not impersonate a
+user. Register all functions before calling `InitializeFunctions`, which initializes
+backend extensions once and returns initialization errors without starting an HTTP
+listener. It does not run `OnServe` hooks.
+
+Calls use the typed `CallJSON` / `Call` path, including validation, ACL and job
+resource gates. Queued handlers returning MCP results must use `dispatch` mode;
+result-less `async` calls are rejected before enqueueing. Dispatch results wait
+with the runtime's context. Cancelling the waiter does not promise to cancel a
+shared running job.
+
+`Option.MCPInputSchema` and `Option.MCPOutputSchema` accept explicit JSON Schema
+objects for dynamic payloads such as `map[string]any` or `any` that the reflection
+schema generator cannot describe. These override catalog schemas, not runtime
+validation; retain typed validation in the handler.

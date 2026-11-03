@@ -189,6 +189,8 @@ func handleMCPRequest(s *Server, c *fiber.Ctx) error {
 
 func dispatchMCPRequest(s *Server, r *Runtime, req *mcpJSONRPCRequest) (any, error) {
 	switch req.Method {
+	case "ping":
+		return map[string]any{}, nil
 	case "initialize":
 		return map[string]any{
 			"protocolVersion": "2024-11-05",
@@ -280,6 +282,9 @@ func mcpFunctionName(opt *Option) string {
 }
 
 func mcpInputSchemaMap(opt *Option) (map[string]any, error) {
+	if opt.MCPInputSchema != nil {
+		return opt.MCPInputSchema, nil
+	}
 	if opt.InputType() == nil {
 		return nil, fmt.Errorf("MCP function %s has no input type", mcpFunctionName(opt))
 	}
@@ -291,6 +296,9 @@ func mcpInputSchemaMap(opt *Option) (map[string]any, error) {
 }
 
 func mcpOutputSchemaMap(opt *Option) (map[string]any, error) {
+	if opt.MCPOutputSchema != nil {
+		return opt.MCPOutputSchema, nil
+	}
 	if opt.OutputType() == nil {
 		return nil, fmt.Errorf("MCP function %s has no output type", mcpFunctionName(opt))
 	}
@@ -599,30 +607,20 @@ func callMCPFunction(s *Server, r *Runtime, opt *Option, args json.RawMessage) (
 		zap.String("mcp", opt.MCP),
 		zap.String("tool", mcpFunctionName(opt)),
 	)
-	_, outputJSON, errJSON, syserr := opt.invoker(r, encodeHandlerName(opt), handlerVersion(opt), args, false, func(input any) error {
-		if s.Config.System.DisableValidator {
-			return nil
+	// Use the public typed Call path so MCP cannot bypass ACL or resource jobs.
+	for _, h := range append(append([]Function{}, s.FunctionCache...), s.internalHandlerCache...) {
+		if h.Options() != opt {
+			continue
 		}
-		return s.Validator.Struct(input)
-	})
-	if syserr != nil {
-		mcpLogError(r, opt.MCP, mcpFunctionName(opt), "system", syserr)
-		return nil, syserr
+		caller, ok := h.(interface {
+			CallJSON(*Runtime, json.RawMessage) (any, error)
+		})
+		if !ok {
+			return nil, fmt.Errorf("MCP function does not support JSON calls")
+		}
+		return caller.CallJSON(r, args)
 	}
-	if len(errJSON) > 0 {
-		err := fmt.Errorf("%s", errJSON)
-		mcpLogError(r, opt.MCP, mcpFunctionName(opt), "function", err)
-		return nil, err
-	}
-	if len(outputJSON) == 0 {
-		return nil, nil
-	}
-	var output any
-	if err := json.Unmarshal(outputJSON, &output); err != nil {
-		mcpLogError(r, opt.MCP, mcpFunctionName(opt), "decode_output", err)
-		return nil, err
-	}
-	return output, nil
+	return nil, fmt.Errorf("MCP function not registered")
 }
 
 func mcpLogInfo(r *Runtime, msg, kind, name string) {

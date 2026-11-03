@@ -62,6 +62,7 @@ type Runtime struct {
 }
 
 type requestMemo struct {
+	jobRefresh     bool
 	jobid          string
 	jobabortctrl   string
 	jobrequeuewait int

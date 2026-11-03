@@ -2,6 +2,7 @@ package allino
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -19,6 +20,7 @@ type jobExecutionContext struct {
 
 func (c *jobExecutionContext) JobMeta(status int) *JobMeta {
 	meta := JobMeta{
+		refresh:  c.r.memo.jobRefresh,
 		Version:  handlerVersion(c.opt),
 		Status:   status,
 		ParentID: c.JobID(),
@@ -26,6 +28,11 @@ func (c *jobExecutionContext) JobMeta(status int) *JobMeta {
 		Priority: c.opt.Job.Priority,
 	}
 
+	if resourceLimitsEnabled(c.opt.Job) {
+		meta.ResourceKey, _ = getResourceKey(c.input)
+		meta.resourceMinInterval = c.opt.Job.MinInterval
+		meta.resourceMaxConcurrent = c.opt.Job.MaxConcurrentPerResource
+	}
 	if c.opt.Job.CacheExpire != 0 {
 		ttl := time.Now().Add(c.opt.Job.CacheExpire)
 		meta.TTL = &ttl
@@ -38,6 +45,11 @@ func (c *jobExecutionContext) MarshalCheck() error {
 		return nil
 	}
 
+	if resourceLimitsEnabled(c.opt.Job) {
+		if _, ok := c.input.(ResourceRequest); !ok {
+			return fmt.Errorf("job input must implement ResourceRequest.ResourceKey() string")
+		}
+	}
 	inJSON, err := json.Marshal(c.input)
 	c.inJSON = inJSON
 	c.inJSONMarshaled = true

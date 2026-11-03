@@ -102,6 +102,8 @@ func NewCodeErrorf(status int, code, format string, a ...any) *Error {
 }
 
 type Error struct {
+	base *Error
+
 	Status int    `json:"-"`
 	Code   string `json:"code,omitempty"`
 	Msg    string `json:"msg,omitempty"`
@@ -121,8 +123,24 @@ func (e *Error) Error() string {
 }
 
 func (e *Error) With(err error) *Error {
-	e.Err = err
-	return e
+	copy := *e
+	copy.Err = err
+	copy.base = e
+	return &copy
+}
+
+// Is preserves sentinel matching for immutable With wrappers.
+func (e *Error) Is(target error) bool {
+	t, ok := target.(*Error)
+	if !ok {
+		return false
+	}
+	for parent := e; parent != nil; parent = parent.base {
+		if parent == t {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Error) Unwrap() error {
