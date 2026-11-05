@@ -57,6 +57,9 @@ func callSQLInit(s *Server, opt *Option) error {
 			})
 		}
 
+		if err := s.callSQLStrategy.startManagedResources(s.appctx, opt.Job.Resources); err != nil {
+			return err
+		}
 		s.jobManager.registerHandler(encodeHandlerName(opt), opt)
 	}
 

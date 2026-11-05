@@ -49,6 +49,7 @@ type JobInfo struct {
 
 type JobMeta struct {
 	refresh               bool
+	resources             []*JobResource
 	ResourceKey           string `json:"resource_key,omitempty"`
 	resourceMinInterval   time.Duration
 	resourceMaxConcurrent int

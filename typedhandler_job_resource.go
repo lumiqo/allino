@@ -19,11 +19,19 @@ var errResourceDeferred = errors.New("job resource start deferred")
 func resourceLimitsEnabled(opt JobOption) bool {
 	return opt.MinInterval > 0 || opt.MaxConcurrentPerResource > 0
 }
+func resourceSchedulingEnabled(opt JobOption) bool {
+	return resourceLimitsEnabled(opt) || len(opt.Resources) > 0
+}
 func validateResourceOptions(opt *Option) error {
+	for _, resource := range opt.Job.Resources {
+		if err := resource.validate(); err != nil {
+			return err
+		}
+	}
 	if opt.Job.MinInterval < 0 || opt.Job.MaxConcurrentPerResource < 0 {
 		return errors.New("resource limits must not be negative")
 	}
-	if resourceLimitsEnabled(opt.Job) && opt.JobMode != JOBMODE_ASYNC && opt.JobMode != JOBMODE_DISPATCH {
+	if resourceSchedulingEnabled(opt.Job) && opt.JobMode != JOBMODE_ASYNC && opt.JobMode != JOBMODE_DISPATCH {
 		return errors.New("resource scheduling requires async or dispatch job mode")
 	}
 	return nil
@@ -65,13 +73,19 @@ func (c *callSQLStrategy) migrateJobResources(ctx context.Context, allow bool) e
    max_concurrent INTEGER NOT NULL,
    next_start_at DATETIME NOT NULL
   ); CREATE INDEX IF NOT EXISTS idx_exec_resource_lease ON executions(resource_key,status,leased_until);`)
-		return err
+		if err != nil {
+			return err
+		}
+		return c.migrateManagedResources(ctx, true)
 	}
 	rows, err := c.db.QueryContext(ctx, "SELECT resource_key,min_interval_ns,max_concurrent,next_start_at FROM job_resources WHERE 1=0")
 	if err != nil {
 		return fmt.Errorf("job_resources schema is missing: enable sql.allow_migrate: %w", err)
 	}
-	return rows.Close()
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	return c.migrateManagedResources(ctx, false)
 }
 func registerResourcePolicy(ctx context.Context, tx *sql.Tx, meta *JobMeta, now time.Time) error {
 	if meta.ResourceKey == "" {

@@ -414,7 +414,7 @@ func (rw *GenericFunction[T, U, E]) call_internal(r *Runtime, input T, fromcall 
 
 	if rw.options != nil &&
 		((fromcall && rw.options.Job.Async) ||
-			resourceLimitsEnabled(rw.options.Job) ||
+			resourceSchedulingEnabled(rw.options.Job) ||
 			rw.options.Job.Dedupe ||
 			rw.options.Job.Cache ||
 			r.memo.jobabortctrl != "") {

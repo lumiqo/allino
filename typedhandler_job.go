@@ -55,6 +55,8 @@ type JobOption struct {
 	// Resource limits apply to queued async/dispatch jobs whose input implements ResourceRequest.
 	MinInterval              time.Duration
 	MaxConcurrentPerResource int
+	// Resources are acquired together before a queued job is leased.
+	Resources []*JobResource `json:"-"`
 
 	OnInputUpgrade  func(version string, old_input_at time.Time, old_input []byte) (bool, any)                     `json:"-"`
 	OnOutputUpgrade func(version string, old_output_at time.Time, old_output, old_error []byte) (bool, any, error) `json:"-"`
@@ -102,6 +104,9 @@ var JobExtension = NewExtension[any, any](
 		},
 
 		OnShutdown: func(s *Server, virtual *Runtime) error {
+			if s.callSQLStrategy != nil {
+				return s.callSQLStrategy.waitManagedResources()
+			}
 			return nil
 		},
 	},
@@ -217,7 +222,7 @@ func (rw *GenericFunction[T, U, E]) call_job(r *Runtime, input T, fromcall bool)
 
 	var zeroU U
 	opt := rw.options
-	asyncExec := (fromcall || resourceLimitsEnabled(opt.Job)) && rw.options.Job.Async
+	asyncExec := (fromcall || resourceSchedulingEnabled(opt.Job)) && rw.options.Job.Async
 	dedupeExec := rw.options.Job.Dedupe
 	cacheExec := rw.options.Job.Cache
 
@@ -457,7 +462,7 @@ func (rw *GenericFunction[T, U, E]) invokeFunctionJSON(r *Runtime, handler, vers
 		}
 	}
 
-	if direct && resourceLimitsEnabled(rw.options.Job) {
+	if direct && resourceSchedulingEnabled(rw.options.Job) {
 		outJSON, errJSON, syserr := marshalOutputSet[U, E](rw.call_job(r, input, true))
 		return key, outJSON, errJSON, syserr
 	}

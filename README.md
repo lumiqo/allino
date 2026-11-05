@@ -196,6 +196,12 @@ Queued SQL jobs also support resource-scoped scheduling through an input method
 shared resources across handlers and worker processes. See
 [resource scheduling](./docs/JOB_RESOURCES.md) for the interface and examples.
 
+`Job.Resources` also supports shared named resources with a capacity limit, lazy
+initialization, and automatic idle release. For example, LLM and image jobs can
+share one GPU and unload its models after five idle minutes. See the
+[managed resource example](./example/jobresources/main.go) and
+[lifecycle documentation](./docs/JOB_RESOURCES.md#managed-resources-initialization-and-idle-release).
+
 These modes make allino especially handy for AI calls, external API aggregation,
 large batch registration, resumable workflows, and state restoration.
 

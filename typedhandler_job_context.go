@@ -20,12 +20,13 @@ type jobExecutionContext struct {
 
 func (c *jobExecutionContext) JobMeta(status int) *JobMeta {
 	meta := JobMeta{
-		refresh:  c.r.memo.jobRefresh,
-		Version:  handlerVersion(c.opt),
-		Status:   status,
-		ParentID: c.JobID(),
-		RootID:   c.r.cache.rootjobid,
-		Priority: c.opt.Job.Priority,
+		refresh:   c.r.memo.jobRefresh,
+		resources: c.opt.Job.Resources,
+		Version:   handlerVersion(c.opt),
+		Status:    status,
+		ParentID:  c.JobID(),
+		RootID:    c.r.cache.rootjobid,
+		Priority:  c.opt.Job.Priority,
 	}
 
 	if resourceLimitsEnabled(c.opt.Job) {

@@ -39,6 +39,10 @@ type callSQLStrategy struct {
 	issqlite bool
 	mu       sync.Mutex
 
+	managedMu    sync.Mutex
+	managed      map[string]*managedResource
+	managedOwner string
+
 	lastDequeuedId atomic.Int64
 	waitInterval   time.Duration
 	waitTimeout    time.Duration
@@ -299,6 +303,24 @@ WHERE (executions.status=2 AND executions.ttl < ?)
 		return false, err
 	}
 
+	if rows > 0 {
+		if _, err = tx.ExecContext(ctx, "DELETE FROM execution_resources WHERE job_key=?", key); err != nil {
+			return false, err
+		}
+		for _, resource := range meta.resources {
+			if err = registerManagedResource(ctx, tx, resource); err != nil {
+				return false, err
+			}
+			// Record demand in the enqueue transaction, even when a short job
+			// starts and finishes entirely between lifecycle maintenance polls.
+			if _, err = tx.ExecContext(ctx, "UPDATE job_managed_resources SET idle_since=NULL WHERE name=?", resource.Name); err != nil {
+				return false, err
+			}
+			if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO execution_resources(job_key,resource_key) VALUES(?,?)", key, resource.Name); err != nil {
+				return false, err
+			}
+		}
+	}
 	if err = tx.Commit(); err != nil {
 		return false, err
 	}
@@ -360,7 +382,7 @@ func (c *callSQLStrategy) Dequeue(
 		args = append(args, h) // handler IN (...)
 	}
 
-	args = append(args, now, now, now)
+	args = append(args, now, now, now, now, now)
 	//optimizeWhere := ""
 
 	//if !c.issqlite {
@@ -390,6 +412,16 @@ WHERE id = (
     AND NOT EXISTS (SELECT 1 FROM executions AS pending WHERE pending.resource_key=candidate.resource_key
       AND pending.status=1 AND pending.leased_until>? AND pending.resource_started_at IS NULL)
   ))
+  AND NOT EXISTS (
+    SELECT 1 FROM execution_resources AS needed
+    LEFT JOIN job_managed_resources AS resource ON resource.name=needed.resource_key
+    WHERE needed.job_key=candidate.key AND (
+      resource.name IS NULL OR resource.state<>'ready' OR resource.owner_until<=?
+      OR (SELECT COUNT(*) FROM execution_resources AS held
+          JOIN executions AS active ON active.key=held.job_key
+          WHERE held.resource_key=needed.resource_key AND active.status=1 AND active.leased_until>?) >= resource.capacity
+    )
+  )
   ORDER BY candidate.priority DESC, candidate.created_at ASC, candidate.id ASC
   LIMIT 1
 )

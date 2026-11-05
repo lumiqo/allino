@@ -132,3 +132,142 @@ policy conflicts, blocked-resource fairness, concurrency limits, cooldown
 persistence, stale starts, migration preserving queued jobs, separate SQLite
 connections competing for the same resource, deferred starts without retries,
 HTTP-style call routing, and completion waiting across a cooldown.
+
+## Managed resources: initialization and idle release
+
+`Job.Resources` adds lifecycle management and multiple resource requirements to
+SQL `async` / `dispatch` jobs. It can be used independently of `ResourceKey()`;
+inputs do not need an interface. Share one definition pointer across handlers:
+
+```go
+var gpu = &allino.JobResource{
+    Name:        "ai-server:gpu0",
+    Capacity:    1,
+    IdleTimeout: 5 * time.Minute,
+    Timeout:     time.Minute,
+    Init: func(ctx context.Context) error {
+        return modelService.Load(ctx)
+    },
+    Release: func(ctx context.Context) error {
+        return modelService.Unload(ctx)
+    },
+}
+
+// Use these options for both LLM inference and image generation handlers.
+options := allino.Option{
+    Name: "llm", Version: "1.0.0", JobMode: "dispatch",
+    Job: allino.JobOption{Resources: []*allino.JobResource{gpu}},
+}
+```
+
+`modelService` represents your inference server adapter. See the compilable
+[HTTP adapter example](../example/jobresources/main.go), which includes LLM,
+image generation, and an independent CPU job. Its `/load` and `/unload` operations
+must be implemented by your model service. Run it with
+`go run ./example/jobresources serve` after starting that adapter on port 9000.
+
+For a job requiring several resources, list them together:
+
+```go
+Job: allino.JobOption{
+    Resources: []*allino.JobResource{gpu, browser},
+}
+```
+
+Each job consumes one permit from every distinct named resource. Duplicate
+references to the same definition consume one permit. `Capacity` must be at
+least one; negative durations are rejected. `IdleTimeout: 0` releases on the next
+idle maintenance pass. `Timeout: 0` gives each callback a one-minute context.
+Callbacks may be nil, for example when only a capacity limit is needed.
+Definitions must be treated as immutable after registration. Different pointers
+with callbacks cannot register the same name in one server. Across servers, a
+name must have identical capacity, idle timeout, callback timeout, and equivalent
+callback behavior. Policy conflicts fail with `ErrResourcePolicyConflict`.
+
+### Execution and demand
+
+Dequeue tests every required resource and leases the job in one SQL statement.
+It never holds a subset while waiting for the rest, preventing resource-order
+deadlocks. Blocked high-priority jobs are skipped; eligible jobs retain the
+existing priority/FIFO ordering. CPU jobs can use every available worker slot
+while GPU jobs wait. This does not reserve a worker slot for CPU jobs when all
+slots are already executing other work. Scheduling is polled using the existing
+worker backoff; freeing capacity makes jobs eligible on the next poll.
+
+Lifecycle callbacks run outside the worker pool. Until initialization succeeds,
+jobs remain queued and consume neither a lease nor a retry. Ready resources are
+reused until there has been no queued or leased demand for `IdleTimeout`.
+Scheduled jobs and delayed retries count as demand, even if another required
+resource prevents them from running. New demand cancels the idle timer. If release
+has already begun, the job stays queued until release and reinitialization finish.
+Idle detection runs every 100 ms, so release may occur slightly after the deadline.
+
+Success, failure, abort, administrative deletion, and requeue use existing job
+state transitions to release capacity; no separate permit counter needs repair.
+Requeue retains requirements. Expired execution leases cease consuming capacity,
+and the existing reaper retries or marks the job failed. Handlers must stop when
+`r.Context()` is canceled, as described in [JOB_LEASES.md](JOB_LEASES.md).
+This scheduler cannot forcibly stop an application goroutine or an external GPU
+operation after its lease expires.
+
+### Ownership, failure, and shutdown
+
+The database stores lifecycle state and a 30-second owner lease. Only its owner
+runs initialization/release; the owner renews every maintenance pass, including
+while a callback runs. Other servers can execute jobs against a ready resource.
+On owner loss, readiness expires and new jobs wait. A replacement owner first
+waits for live execution leases to drain, runs recovery release, then initializes
+again if queued demand exists. Late lifecycle completion from the previous owner
+is rejected by the database ownership check.
+
+Callbacks must be idempotent, tolerate partially initialized state, and honor
+context cancellation. Errors, panics, and callback deadlines make the resource
+unavailable. Cleanup is retried after a one-second backoff; successful cleanup
+allows initialization to retry. Jobs keep waiting without consuming application
+retries. Persistent callback failures therefore leave jobs queued, with diagnostic
+logs and `job_managed_resources.last_error` available for investigation.
+
+Go cannot forcibly interrupt a callback. If it ignores its deadline, the resource
+stays unavailable and its owner continues renewing ownership until the callback
+returns. Cleanup is not allowed to overlap that callback. During server shutdown,
+callback contexts are canceled and cleanup is attempted after live job leases
+drain; queued jobs do not prevent shutdown cleanup. Shutdown waiting is bounded by
+30 seconds plus the longest callback timeout (and a one-second margin). If jobs
+do not drain within 30 seconds, cleanup is left to ownership recovery. A callback
+that never returns may leave a goroutine until process exit.
+
+Database fencing cannot stop external side effects from a paused or partitioned
+old process. For strict fencing, enforce tokens/ownership in the external service
+or isolate/terminate the old process before recovery. All servers using the same
+name must address the **same underlying resource**: a shared GPU service, browser
+service, container, or process endpoint. Process-local model pointers cannot be
+shared through SQL. Independent GPUs on different hosts need different names
+and appropriately routed handlers. Avoid running mutually dependent work inside
+lifecycle callbacks, and do not synchronously await a job needing a resource held
+by the calling job.
+
+### Managed resource storage and compatibility
+
+The additive migration creates `job_managed_resources`, `execution_resources`,
+an index, and demand/deletion triggers. Existing jobs retain their original requirements;
+new handler requirements are attached when a new execution is enqueued. Enable
+`sql.allow_migrate: true` once and stop older workers before the upgrade. Policies
+persist; change a policy only after quiescing all affected workers/jobs, or use a
+new versioned name. SQLite is the supported/tested backend for this feature;
+multiple servers must share the same database with reliable SQLite file locking.
+For concurrent connections, configure a busy timeout, for example
+`jobs.db?_pragma=busy_timeout(5000)` with `modernc.org/sqlite`.
+
+Legacy `ResourceKey()` limits and managed resource requirements are independent
+gates and can be combined. Redis stream jobs and synchronous job modes do not
+support managed resources. Resource-free jobs keep the existing execution path
+and need no new application configuration. There is no strict starvation-free
+fairness across jobs requesting different resource combinations, and lifecycle
+initialization of different resources runs independently. If two models cannot
+coexist in VRAM, manage their loading/switching inside a single shared GPU service;
+declaring separate model resources does not itself implement model eviction.
+
+Managed resource tests add coverage for atomic multiple-resource acquisition,
+CPU progress during initialization, reuse, queued/retry demand, idle cancellation,
+arrival during release, capacity across separate connections, lease expiry,
+owner recovery and fencing, callback errors/panics/deadlines, shutdown, and migration.
