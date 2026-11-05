@@ -2,6 +2,7 @@ package revoker
 
 import (
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -10,7 +11,7 @@ import (
 	"github.com/wh-kuromai/cryptino"
 )
 
-var revoker *Revoker
+var revoker = NewRevoker()
 
 var RevokerExtension = allino.NewExtension[any, any](
 	"revoker",
@@ -62,6 +63,7 @@ var RevokePrefixHandler = allino.NewFunction(
 )
 
 type Revoker struct {
+	mu                   sync.RWMutex
 	revokeRotateInterval time.Duration
 	revokeKeepBuckets    int
 	revokeBuckets        atomic.Pointer[[]revokeBucket]
@@ -112,23 +114,25 @@ func (r *Revoker) revokeRotator() {
 	ticker := time.NewTicker(r.revokeRotateInterval)
 
 	for range ticker.C {
-		old := r.revokeBuckets.Load()
-
-		next := make([]revokeBucket, 0, r.revokeKeepBuckets)
-
-		next = append(next, revokeBucket{
-			since: time.Now(),
-			trie:  trie.NewTrie[revokeSet](),
-		})
-
-		next = append(next, (*old)...)
-
-		if len(next) > r.revokeKeepBuckets {
-			next = next[:r.revokeKeepBuckets]
-		}
-
-		r.revokeBuckets.Store(&next)
+		r.rotate()
 	}
+}
+
+func (r *Revoker) rotate() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	old := r.revokeBuckets.Load()
+	next := append([]revokeBucket{{since: time.Now(), trie: trie.NewTrie[revokeSet]()}}, (*old)...)
+	if len(next) > r.revokeKeepBuckets {
+		next = next[:r.revokeKeepBuckets]
+	}
+	r.revokeBuckets.Store(&next)
+	oldMaps := r.revokeMaps.Load()
+	nextMaps := append([]revokeMap{{since: time.Now(), kvs: make(map[string]revokeSet)}}, (*oldMaps)...)
+	if len(nextMaps) > r.revokeKeepBuckets {
+		nextMaps = nextMaps[:r.revokeKeepBuckets]
+	}
+	r.revokeMaps.Store(&nextMaps)
 }
 
 func (r *Revoker) current() *revokeBucket {
@@ -155,8 +159,13 @@ func (r *Revoker) Revoke(req *allino.Runtime, scope string, t time.Time, reason 
 }
 
 func (r *Revoker) Insert(scope string, t time.Time, reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	kvs := r.revokeMaps.Load()
 	kvss := &(*kvs)[0]
+	if old, ok := kvss.kvs[scope]; ok && old.when > t.Unix() {
+		return
+	}
 	kvss.kvs[scope] = revokeSet{
 		when:   t.Unix(),
 		reason: reason,
@@ -164,6 +173,8 @@ func (r *Revoker) Insert(scope string, t time.Time, reason string) {
 }
 
 func (r *Revoker) InsertPrefix(scope string, t time.Time, reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.current().trie.Insert(scope, revokeSet{
 		when:   t.Unix(),
 		reason: reason,
@@ -171,6 +182,8 @@ func (r *Revoker) InsertPrefix(scope string, t time.Time, reason string) {
 }
 
 func (r *Revoker) IsRevoked(scope string, issuedAt time.Time) (revoked bool, reason string) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	revoked, reason = r.isRevoked(scope, issuedAt)
 	if revoked {
 		return true, reason
