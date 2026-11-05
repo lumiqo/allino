@@ -21,6 +21,7 @@ type jobExecutionContext struct {
 func (c *jobExecutionContext) JobMeta(status int) *JobMeta {
 	meta := JobMeta{
 		refresh:   c.r.memo.jobRefresh,
+		user:      c.r.snapshotJobUser(),
 		resources: c.opt.Job.Resources,
 		Version:   handlerVersion(c.opt),
 		Status:    status,

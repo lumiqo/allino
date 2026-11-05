@@ -46,6 +46,7 @@ func getResourceKey(input any) (string, bool) {
 
 func (c *callSQLStrategy) migrateJobResources(ctx context.Context, allow bool) error {
 	for _, column := range []struct{ name, definition string }{
+		{"user_context", "TEXT"},
 		{"resource_key", "TEXT NOT NULL DEFAULT ''"},
 		{"resource_started_at", "DATETIME"},
 	} {

@@ -174,7 +174,10 @@ func (r *Runtime) ClaimUnmarshal(obj any) error {
 }
 
 func (r *Runtime) userWithJWT() (uid, displayname string, writable bool, jwtbody []byte, err error) {
-	du := r.fiber.Query(".user")
+	du := ""
+	if r.fiber != nil {
+		du = r.fiber.Query(".user")
+	}
 	if r.config.Debug && du != "" {
 		r.cache.authorizedBy = "debug"
 		return du, du, true, nil, nil
@@ -182,6 +185,10 @@ func (r *Runtime) userWithJWT() (uid, displayname string, writable bool, jwtbody
 
 	if r.cache.cachedLogin {
 		return r.cache.cachedUid, r.cache.cachedName, r.cache.cachedWritable, r.cache.cachedJWTBody, r.cache.cachedErr
+	}
+
+	if r.fiber == nil {
+		return "", "", false, nil, ErrNotLoggedIn
 	}
 
 	jwt, writable, err := r.user()

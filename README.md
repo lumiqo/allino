@@ -190,6 +190,15 @@ Supported modes include:
 - `async` / `dispatch`: enqueue work and resume later
 - `fanout` / `replay` / `replayall`: Redis stream based broadcast/replay modes
 
+Queued SQL jobs automatically preserve the caller’s `User()` identity (ID, display
+name, and writable flag) and `AuthorizedBy()` when enqueued. Workers restore this
+snapshot before running the handler, including retries and child jobs. JWT tokens
+and custom claims are not copied; permissions reflect enqueue time. Existing jobs
+without a snapshot run anonymously. Upgrading an existing database requires
+`sql.allow_migrate` to add `executions.user_context`. Identity does not change job
+IDs or cache keys: include the user ID in the input or `IdempotencyKey()` when
+results must be isolated per user. Redis stream modes do not copy this snapshot.
+
 Queued SQL jobs also support resource-scoped scheduling through an input method
 `ResourceKey() string`. Set `Job.MinInterval` and/or
 `Job.MaxConcurrentPerResource` to coordinate domains, browser profiles or other

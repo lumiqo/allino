@@ -3,6 +3,7 @@ package allino
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -270,14 +271,15 @@ func (c *callSQLStrategy) Enqueue(
 	}
 	res, err := tx.ExecContext(ctx, `
 INSERT INTO executions
-(key, handler, version, status, parentid, rootid, priority, ttl, created_at, updated_at, run_at, input,resource_key)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+(key, handler, version, status, parentid, rootid, priority, ttl, created_at, updated_at, run_at, input,resource_key,user_context)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 
 ON CONFLICT(key) DO UPDATE SET
 	handler=excluded.handler,
 	version=excluded.version,
 	status=excluded.status,
  resource_key=excluded.resource_key,
+ user_context=excluded.user_context,
  resource_started_at=NULL,
  lease_token=NULL,
  leased_until=NULL,
@@ -292,7 +294,7 @@ ON CONFLICT(key) DO UPDATE SET
 WHERE (executions.status=2 AND executions.ttl < ?)
  OR (? AND executions.status IN (2,3))
 `, key, handler, meta.Version, meta.Status, meta.ParentID, meta.RootID,
-		meta.Priority, meta.TTL, now, now, now.Add(time.Duration(delay_sec)*time.Second), injson, meta.ResourceKey, now, meta.refresh)
+		meta.Priority, meta.TTL, now, now, now.Add(time.Duration(delay_sec)*time.Second), injson, meta.ResourceKey, encodeJobUser(meta.user), now, meta.refresh)
 
 	if err != nil {
 		return false, err
@@ -426,11 +428,12 @@ WHERE id = (
   LIMIT 1
 )
 RETURNING
-  id, key, handler, version, status, parentid, rootid, input,resource_key
+  id, key, handler, version, status, parentid, rootid, input,resource_key,user_context
 `, strings.Join(placeholders, ","))
 
 	row := tx.QueryRowContext(ctx, q, args...)
 	var id int64
+	var userContext sql.NullString
 	if err := row.Scan(
 		&id,
 		&key,
@@ -441,6 +444,7 @@ RETURNING
 		&meta.RootID,
 		&injson,
 		&meta.ResourceKey,
+		&userContext,
 	); err != nil {
 
 		// UPDATE が 0件なら RETURNING も 0行 -> sql.ErrNoRows
@@ -448,6 +452,12 @@ RETURNING
 			return nil, ErrJobNotFound
 		}
 		return nil, err
+	}
+
+	if userContext.Valid {
+		if err := json.Unmarshal([]byte(userContext.String), &meta.user); err != nil {
+			return nil, fmt.Errorf("decode job user: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {

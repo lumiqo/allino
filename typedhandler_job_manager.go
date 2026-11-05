@@ -201,6 +201,7 @@ func (jobm *jobManager) runTask(sv *Server, opt *Option, jtask JobTask, delay ti
 	// Preserve interval accounting from when this slot accepted the task.
 	started = scheduledAt
 	r := NewRuntime(sv, nil)
+	r.restoreJobUser(jtask.Meta().user)
 	r.ctx = ctx
 	defer r.do_defer()
 	r.cache.requestid = jtask.Key()

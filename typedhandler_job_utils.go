@@ -48,6 +48,7 @@ type JobInfo struct {
 }
 
 type JobMeta struct {
+	user                  *jobUser
 	refresh               bool
 	resources             []*JobResource
 	ResourceKey           string `json:"resource_key,omitempty"`
