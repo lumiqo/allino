@@ -16,7 +16,13 @@ var revoker = NewRevoker()
 var RevokerExtension = allino.NewExtension[any, any](
 	"revoker",
 	&allino.ExtOption{
+		OnInit: initializeSQLCookies,
 		OnAuthZ: func(r *allino.Runtime, jwt *cryptino.JSONWebToken) (*cryptino.JSONWebToken, error) {
+			if r.Config().Login.Revoke.UseSQLCookieRevoke {
+				if err := checkSQLCookie(r, jwt); err != nil {
+					return nil, err
+				}
+			}
 			if r.Config().Login.Revoke.UseLoginRevoke {
 				revoked, reason := revoker.IsRevoked(jwt.Body.Subject, time.Unix(jwt.Body.IssuedAt, 0))
 				if revoked {

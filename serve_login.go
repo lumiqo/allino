@@ -336,7 +336,7 @@ func (r *Runtime) AuthorizedBy() string {
 }
 
 func IssueCSRFToken(r *Runtime, uid string) string {
-	jwt := cryptino.GetJWTBasic(uid, r.config.Login.CSRFToken.Expire)
+	jwt := loginJWT(uid, r.config.Login.CSRFToken.Expire)
 	jwt.Body.Audience = r.config.Login.CSRFToken.JWTAudience
 
 	csrftoken, err := jwt.Marshal(cryptino.ES256(), r.config.Login.PrivateKey)
@@ -348,7 +348,7 @@ func IssueCSRFToken(r *Runtime, uid string) string {
 }
 
 func IssueAccessToken(r *Runtime, uid, name string, custom ...map[string]any) string {
-	jwt := cryptino.GetJWTBasic(uid, r.config.Login.OAuth.Expire)
+	jwt := loginJWT(uid, r.config.Login.OAuth.Expire)
 	jwt.Body.Audience = r.config.Login.OAuth.JWTAudience
 	jwt.Body.Name = name
 	if len(custom) > 0 {
@@ -364,7 +364,7 @@ func IssueAccessToken(r *Runtime, uid, name string, custom ...map[string]any) st
 }
 
 func IssueAPIKey(r *Runtime, uid, name string, custom ...map[string]any) string {
-	jwt := cryptino.GetJWTBasic(uid, r.config.Login.OAuth.ExpireLong)
+	jwt := loginJWT(uid, r.config.Login.OAuth.ExpireLong)
 	jwt.Body.Audience = r.config.Login.OAuth.JWTAudience
 	jwt.Body.Name = name
 	if len(custom) > 0 {
@@ -380,7 +380,7 @@ func IssueAPIKey(r *Runtime, uid, name string, custom ...map[string]any) string 
 }
 
 func IssueLoginCookie(r *Runtime, uid, name string, custom ...map[string]any) *fiber.Cookie {
-	jwt := cryptino.GetJWTBasic(uid, r.config.Login.LoginCookie.Expire)
+	jwt := loginJWT(uid, r.config.Login.LoginCookie.Expire)
 	jwt.Body.Audience = r.config.Login.LoginCookie.JWTAudience
 	jwt.Body.Name = name
 	if len(custom) > 0 {
@@ -398,7 +398,7 @@ func IssueLoginCookie(r *Runtime, uid, name string, custom ...map[string]any) *f
 
 func IssueGuestCookie(r *Runtime) *fiber.Cookie {
 	sid := r.SessionID(false)
-	jwt := cryptino.GetJWTBasic(sid, r.config.Login.GuestCookie.Expire)
+	jwt := loginJWT(sid, r.config.Login.GuestCookie.Expire)
 	jwt.Body.Audience = r.config.Login.GuestCookie.JWTAudience
 
 	jwtbuf, err := jwt.Marshal(cryptino.ES256(), r.config.Login.PrivateKey)
@@ -408,4 +408,53 @@ func IssueGuestCookie(r *Runtime) *fiber.Cookie {
 	}
 
 	return r.config.Login.GuestCookie.ToFiberCookie(string(jwtbuf))
+}
+
+// loginJWT uses seconds for NumericDate claims (cryptino's legacy helper casts
+// time.Duration directly to int64). A unique ID allows individual revocation.
+func loginJWT(uid string, ttl time.Duration) *cryptino.JSONWebToken {
+	jwt := cryptino.GetJWT()
+	jwt.Header.Type = "JWT"
+	jwt.Body.Subject = uid
+	jwt.Body.IssuedAt = time.Now().Unix()
+	jwt.Body.ExpirationTime = time.Now().Add(ttl).Unix()
+	jwt.Body.JwtID = uuid.NewString()
+	return jwt
+}
+
+// LoginCookieUser authenticates only the configured login cookie. It never
+// accepts debug users, AssumeUser, OAuth tokens, or guest cookies.
+func (r *Runtime) LoginCookieUser() (string, error) {
+	if r.fiber == nil || r.config.Login.PublicKey == nil {
+		return "", ErrNotLoggedIn
+	}
+	token := r.fiber.Cookies(r.config.Login.LoginCookie.Name)
+	if token == "" {
+		return "", ErrNotLoggedIn
+	}
+	jwt, err := cryptino.VerifyJWT(cryptino.ES256(), []byte(token), r.config.Login.PublicKey)
+	if err != nil || jwt.Body.Audience != r.config.Login.LoginCookie.JWTAudience || jwt.Body.Subject == "" || jwt.Body.ExpirationTime <= time.Now().Unix() {
+		return "", ErrNotLoggedIn
+	}
+	for _, ext := range r.server.extopts {
+		if ext.OnAuthZ != nil {
+			jwt, err = ext.OnAuthZ(r, jwt)
+			if err != nil {
+				return "", err
+			}
+			if jwt == nil {
+				return "", ErrNotLoggedIn
+			}
+		}
+	}
+	return jwt.Body.Subject, nil
+}
+
+// ClearLoginCookie deletes the cookie using the configured name, path and domain.
+func ClearLoginCookie(r *Runtime) {
+	c := r.config.Login.LoginCookie.ToFiberCookie("")
+	c.Secure = c.Secure || r.fiber.Protocol() == "https"
+	c.MaxAge = -1
+	c.Expires = time.Unix(1, 0)
+	r.fiber.Cookie(c)
 }

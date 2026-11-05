@@ -513,3 +513,18 @@ var SampleAPIFunction = allino.NewFunction(
 		}, nil
 	})
 ```
+
+### Persistent login-cookie revocation (SQLite)
+
+Import `github.com/wh-kuromai/allino/ext/revoker` and enable
+`Login.Revoke.UseSQLCookieRevoke` to persist individual JWT cookie revocations.
+The extension creates `allino_revoked_cookies` in the configured SQLite database.
+Call `revoker.RevokeLoginCookie(r)` before `allino.ClearLoginCookie(r)` on logout;
+check the error before reporting success. This path is synchronous and needs no
+Redis. Expired revocations are cleaned up during subsequent revocation requests.
+Keep the signing key stable across restarts and share the database and signing
+key between instances. Cookie-only applications can use `r.LoginCookieUser()`;
+this verifies signature, audience, expiry and authorization hooks without debug
+identities or OAuth fallback. Applications still need CSRF protection for writes.
+`UseLoginRevoke` remains the separate in-memory, subject/prefix-based revoker;
+it does not persist revocations across restarts.
